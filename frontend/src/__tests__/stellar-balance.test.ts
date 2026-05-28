@@ -99,7 +99,7 @@ describe("getBalance", () => {
     globalFetchMock.mockResolvedValue({
       ok: true,
       json: async () => { throw new SyntaxError("Unexpected token < in JSON at position 0"); },
-    } as Response);
+    } as unknown as Response);
 
     // 2. Act
     const balance = await getBalance("GBX...MOCK_PUBLIC_KEY");
