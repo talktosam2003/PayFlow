@@ -140,6 +140,7 @@ impl FlowPay {
             active: true,
             paused: false,
             token,
+            trial_duration,
         };
 
         env.storage()

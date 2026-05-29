@@ -19,6 +19,26 @@ function formatInterval(secs: number): string {
   return `${secs}s`;
 }
 
+function formatTrialStatus(
+  trial_duration: number,
+  last_charged: number
+): { isInTrial: boolean; trialEndDate: string; trialDaysRemaining: number } {
+  if (trial_duration === 0) {
+    return { isInTrial: false, trialEndDate: "", trialDaysRemaining: 0 };
+  }
+
+  const trialEndTimestamp = last_charged + trial_duration;
+  const now = Math.floor(Date.now() / 1000);
+  const isInTrial = now < trialEndTimestamp;
+  const trialEndDate = new Date(trialEndTimestamp * 1000).toLocaleDateString();
+  const trialDaysRemaining = Math.max(
+    0,
+    Math.ceil((trialEndTimestamp - now) / (24 * 60 * 60))
+  );
+
+  return { isInTrial, trialEndDate, trialDaysRemaining };
+}
+
 export default function SubscriptionCard({
   subscription,
   onCancel,
@@ -37,7 +57,7 @@ export default function SubscriptionCard({
           )}
         </div>
         <span className={`badge ${active ? "badge-active" : "badge-inactive"}`}>
-          {active ? "Active" : "Cancelled"}
+          {active ? (isInTrial ? "Trial Active" : "Active") : "Cancelled"}
         </span>
       </div>
 
