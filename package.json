@@ -1,0 +1,21 @@
+{
+  "name": "payflow",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "prepare": "husky",
+    "build:frontend": "cd frontend && npm ci && npm run build",
+    "typecheck": "cd frontend && ./node_modules/.bin/tsc --noEmit",
+    "backend:typecheck": "cd contract && cargo check",
+    "backend:test": "cd contract && cargo test"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7",
+    "lint-staged": "^15.5.2"
+  },
+  "lint-staged": {
+    "frontend/src/**/*.{ts,tsx}": [
+      "bash -c 'cd frontend && npx tsc --noEmit'"
+    ]
+  }
+}

@@ -1,0 +1,1120 @@
+# Contract API Reference
+
+This document is the complete reference for the FlowPay Soroban smart contract. It covers every public function, its parameters, return values, auth requirements, and error conditions.
+
+---
+
+## Data Types
+
+### `Subscription`
+
+The core data structure stored per subscriber.
+
+```rust
+pub struct Subscription {
+    pub merchant: Address,   // Stellar address of the payment recipient
+    pub amount: i128,        // Amount per period, in stroops (1 XLM = 10_000_000)
+    pub interval: u64,       // Seconds between charges
+    pub last_charged: u64,   // Ledger UNIX timestamp of the last successful charge
+    pub active: bool,        // false if the subscription has been cancelled
+    pub paused: bool,        // true if the subscription is temporarily paused
+    pub token: Address,      // SAC token address used for this subscription
+}
+```
+
+### `DataKey`
+
+Internal storage keys. Not part of the public API but useful for understanding storage layout.
+
+```rust
+pub enum DataKey {
+    Subscription(Address),      // persistent — one entry per subscriber
+    Token,                      // instance — the token contract address
+    GracePeriod,                // instance — seconds allowed for charge window
+    MerchantWhitelist(Address), // persistent — true if merchant is whitelisted
+    WhitelistEnabled,           // instance — true if whitelist is active
+    FeeCollector,               // instance — fee collector address
+    FeeBps,                     // instance — protocol fee in basis points
+    ActiveCount,                // instance — running total of active subscriptions
+    MerchantRevenue(Address),   // persistent — cumulative revenue per merchant
+    DailyLimit(Address),        // temporary — user-set daily pay_per_use cap
+    DailySpent(Address),        // temporary — amount spent today via pay_per_use
+}
+```
+
+---
+
+## Functions
+
+---
+
+### `initialize`
+
+One-time contract setup. Must be called before any other function.
+
+```
+initialize(env: Env, token: Address)
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `token` | `Address` | The Stellar Asset Contract (SAC) address of the token to use for payments |
+
+**Auth:** None required.
+
+**Storage written:** `DataKey::Token` in instance storage.
+
+**Errors**
+
+| Condition | Panic message |
+| --- | --- |
+| Called more than once | `"already initialized"` |
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source deployer \
+  --network testnet \
+  -- initialize \
+  --token CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+```
+
+---
+
+### `subscribe`
+
+Creates or overwrites a subscription for the calling user.
+
+```
+subscribe(env: Env, user: Address, merchant: Address, amount: i128, interval: u64, token: Address, trial_period: Option<u64>, referrer: Option<Address>)
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber. Must match the transaction signer. |
+| `merchant` | `Address` | The payment recipient. |
+| `amount` | `i128` | Stroops to transfer per period. Must be > 0. |
+| `interval` | `u64` | Seconds between charges. Must be > 0. Common values: `86400` (1 day), `604800` (1 week), `2592000` (~30 days). |
+| `token` | `Address` | The SAC address of the token to use for this subscription. |
+| `trial_period` | `Option<u64>` | Optional seconds to delay the first charge. If set, `last_charged` is initialized to `now + trial_period`. |
+| `referrer` | `Option<Address>` | Optional address of the referrer who introduced this subscriber. |
+
+**Auth:** `user.require_auth()` — the transaction must be signed by `user`.
+
+**Whitelist:** If the merchant whitelist is enabled, the `merchant` address must have been previously added by an admin via `add_merchant`.
+
+**Storage written:** `DataKey::Subscription(user)` in persistent storage. `last_charged` is set to the current ledger timestamp (or `now + trial_period` if provided). `DataKey::Referral(user)` in persistent storage if referrer is provided.
+
+**Events emitted**
+
+```
+topic:  ("subscribed", user)
+data:   (merchant, amount, interval)
+topic:  ("referred", user) if referrer is provided
+data:   referrer_address
+```
+
+**Errors**
+
+| Condition | Panic message / error |
+| --- | --- |
+| `amount <= 0` | `"amount must be positive"` |
+| `interval == 0` | `"interval must be positive"` |
+| Merchant not whitelisted (if enabled) | `MerchantNotWhitelisted` |
+
+**Pre-condition:** The user must have called `approve()` on the token contract granting the FlowPay contract an allowance of at least `amount` before subscribing.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <USER_KEY> \
+  --network testnet \
+  -- subscribe \
+  --user <USER_ADDRESS> \
+  --merchant <MERCHANT_ADDRESS> \
+  --amount 50000000 \
+  --interval 2592000
+```
+
+---
+
+### `charge`
+
+Triggers a recurring charge for a subscriber. Permissionless — anyone can call this.
+
+```
+charge(env: Env, user: Address)
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber to charge. |
+
+**Auth:** None. This function is intentionally permissionless so keeper services can call it without holding user keys.
+
+**What it does:**
+1. Loads the subscription for `user`
+2. Asserts `active == true`
+3. Asserts `now >= last_charged + interval`
+4. If a `grace_period` is set, asserts `now <= last_charged + interval + grace_period`
+5. If a protocol fee is set, splits `amount` between `FeeCollector` and `merchant`
+6. Calls `transfer_from(contract, user, recipient, amount)` on the token contract
+7. Updates `last_charged = now`
+
+**Events emitted**
+
+```
+topic:  ("charged", user)
+data:   (merchant, amount, timestamp)
+```
+
+**Errors**
+
+| Condition | Panic message |
+| --- | --- |
+| No subscription exists | `"no subscription found"` |
+| Subscription is cancelled | `"subscription is not active"` |
+| Subscription is paused | `"subscription is paused"` |
+| Interval has not elapsed | `"interval not elapsed yet"` |
+| Grace period elapsed | `"grace period elapsed"` |
+| Contract not initialized | `"not initialized"` |
+| Insufficient allowance | Host error from token contract |
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <KEEPER_KEY> \
+  --network testnet \
+  -- charge \
+  --user <USER_ADDRESS>
+```
+
+---
+
+### `pay_per_use`
+
+Instantly transfers an arbitrary amount from the user to their subscribed merchant. No interval check. Useful for metered or usage-based billing.
+
+```
+pay_per_use(env: Env, user: Address, amount: i128)
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The payer. Must match the transaction signer. |
+| `amount` | `i128` | Stroops to transfer. Must be > 0. |
+
+**Auth:** `user.require_auth()`.
+
+**What it does:**
+1. Loads the subscription for `user`
+2. Asserts `active == true`
+3. Calls `transfer_from(contract, user, merchant, amount)` on the token contract
+
+Note: `pay_per_use` does **not** update `last_charged`. It is independent of the recurring billing cycle.
+
+**Events emitted**
+
+```
+topic:  ("pay_per_use", user)
+data:   (merchant, amount)
+```
+
+**Errors**
+
+| Condition | Panic message |
+| --- | --- |
+| `amount <= 0` | `"amount must be positive"` |
+| No subscription exists | `"no subscription found"` |
+| Subscription is cancelled | `"subscription is not active"` |
+| Subscription is paused | `"subscription is paused"` |
+| Insufficient allowance | Host error from token contract |
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <USER_KEY> \
+  --network testnet \
+  -- pay_per_use \
+  --user <USER_ADDRESS> \
+  --amount 1000000
+```
+
+---
+
+### `pause`
+
+Temporarily halts charges for a subscription. The subscription record is preserved and can be resumed at any time. Both `charge()` and `pay_per_use()` will panic while paused.
+
+```
+pause(env: Env, user: Address)
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber. Must match the transaction signer. |
+
+**Auth:** `user.require_auth()`.
+
+**Events emitted**
+
+```
+topic:  ("paused", user)
+data:   ()
+```
+
+**Errors**
+
+| Condition | Panic message |
+| --- | --- |
+| No subscription exists | `"no subscription found"` |
+| Subscription is cancelled | `"subscription is not active"` |
+| Subscription already paused | `"subscription is already paused"` |
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <USER_KEY> \
+  --network testnet \
+  -- pause \
+  --user <USER_ADDRESS>
+```
+
+---
+
+### `resume`
+
+Resumes a paused subscription, re-enabling `charge()` and `pay_per_use()`.
+
+```
+resume(env: Env, user: Address)
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber. Must match the transaction signer. |
+
+**Auth:** `user.require_auth()`.
+
+**Events emitted**
+
+```
+topic:  ("resumed", user)
+data:   ()
+```
+
+**Errors**
+
+| Condition | Panic message |
+| --- | --- |
+| No subscription exists | `"no subscription found"` |
+| Subscription is cancelled | `"subscription is not active"` |
+| Subscription is not paused | `"subscription is not paused"` |
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <USER_KEY> \
+  --network testnet \
+  -- resume \
+  --user <USER_ADDRESS>
+```
+
+---
+
+### `cancel`
+
+Deactivates a subscription. The subscription record remains in storage with `active = false`. No further charges can be made.
+
+```
+cancel(env: Env, user: Address)
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber. Must match the transaction signer. |
+
+**Auth:** `user.require_auth()`.
+
+**Events emitted**
+
+```
+topic:  ("cancelled", user)
+data:   ()
+```
+
+**Errors**
+
+| Condition | Panic message |
+| --- | --- |
+| No subscription exists | `"no subscription found"` |
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <USER_KEY> \
+  --network testnet \
+  -- cancel \
+  --user <USER_ADDRESS>
+```
+
+---
+
+### `get_subscription`
+
+Read-only view function. Returns the subscription for a given user, or `None` if none exists.
+
+```
+get_subscription(env: Env, user: Address) -> Option<Subscription>
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber address to look up. |
+
+**Auth:** None.
+
+**Returns:** `Option<Subscription>` — `None` if no subscription exists for this address.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_subscription \
+  --user <USER_ADDRESS>
+```
+
+---
+
+### `next_charge_at`
+
+Read-only view function. Returns the Unix timestamp of the next scheduled charge for a user.
+
+```
+next_charge_at(env: Env, user: Address) -> Option<u64>
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber address to look up. |
+
+**Auth:** None.
+
+**Returns:** `Option<u64>` — Returns `None` if:
+- No subscription exists for the user
+- The subscription is inactive (cancelled)
+
+Returns `Some(last_charged + interval)` if the subscription is active.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- next_charge_at \
+  --user <USER_ADDRESS>
+```
+
+---
+
+### `batch_charge`
+
+Charges multiple subscribers in a single transaction. Individual failures do not abort the batch — every address is processed and its outcome is returned.
+
+```
+batch_charge(env: Env, users: Vec<Address>) -> Vec<ChargeResult>
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `users` | `Vec<Address>` | List of subscriber addresses to attempt charging. |
+
+**Auth:** None. Same permissionless model as `charge()`.
+
+**Returns:** `Vec<ChargeResult>` — one entry per input address, in order.
+
+```rust
+pub enum ChargeResult {
+    Charged,            // funds transferred successfully
+    Skipped,            // interval has not elapsed yet
+    NoSubscription,     // no subscription found for this address
+    Inactive,           // subscription is cancelled
+    Paused,             // subscription is paused
+    GracePeriodElapsed, // charge window has closed
+}
+```
+
+**Storage written:** `DataKey::Subscription(user)` updated for each `Charged` result. `DataKey::MerchantRevenue(merchant)` incremented for each `Charged` result.
+
+**Events emitted:** `("charged", user)` for each successfully charged user.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <KEEPER_KEY> \
+  --network testnet \
+  -- batch_charge \
+  --users '["<USER_A>","<USER_B>","<USER_C>"]'
+```
+
+---
+
+### `get_active_count`
+
+Returns the current number of active subscriptions. Incremented by `subscribe()`, decremented by `cancel()`.
+
+```
+get_active_count(env: Env) -> u64
+```
+
+**Auth:** None.
+
+**Returns:** `u64` — total active subscriptions.
+
+**Storage read:** `DataKey::ActiveCount` in instance storage.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_active_count
+```
+
+---
+
+### `get_merchant_revenue`
+
+Returns the cumulative amount charged to a merchant's subscribers across all `charge()` and `pay_per_use()` calls.
+
+```
+get_merchant_revenue(env: Env, merchant: Address) -> i128
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `merchant` | `Address` | The merchant address to query. |
+
+**Auth:** None.
+
+**Returns:** `i128` — total stroops received by this merchant. Returns `0` if no charges have occurred.
+
+**Storage read:** `DataKey::MerchantRevenue(merchant)` in persistent storage.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_merchant_revenue \
+  --merchant <MERCHANT_ADDRESS>
+```
+
+---
+
+### `set_daily_limit`
+
+Sets a daily spending cap for `pay_per_use()` for the calling user. The limit is stored in temporary storage and resets automatically after approximately one day (~17,280 ledgers at 5 s/ledger).
+
+```
+set_daily_limit(env: Env, user: Address, limit: i128)
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber. Must match the transaction signer. |
+| `limit` | `i128` | Maximum stroops spendable via `pay_per_use()` per day. Must be > 0. |
+
+**Auth:** `user.require_auth()`.
+
+**Storage written:** `DataKey::DailyLimit(user)` in temporary storage with TTL of ~1 day.
+
+**Enforcement:** Every `pay_per_use()` call checks `DailySpent(user) + amount <= DailyLimit(user)` before transferring. The running total is tracked in `DataKey::DailySpent(user)` (also temporary, same TTL).
+
+**Errors**
+
+| Condition | Panic message |
+| --- | --- |
+| `limit <= 0` | `"limit must be positive"` |
+| Spend would exceed limit | `"daily spending limit exceeded"` |
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <USER_KEY> \
+  --network testnet \
+  -- set_daily_limit \
+  --user <USER_ADDRESS> \
+  --limit 50000000
+```
+
+---
+
+### `get_daily_limit`
+
+Returns the current daily spending limit for the calling user, or `None` if no limit is set.
+
+```
+get_daily_limit(env: Env, user: Address) -> Option<i128>
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber address to query. |
+
+**Auth:** None.
+
+**Returns:** `Option<i128>` — current daily limit in stroops, or `None` if unset.
+
+**Storage read:** `DataKey::DailyLimit(user)` in temporary storage.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_daily_limit \
+  --user <USER_ADDRESS>
+```
+
+---
+
+### `get_daily_spent`
+
+Returns the amount spent today by the calling user via `pay_per_use()`.
+
+```
+get_daily_spent(env: Env, user: Address) -> i128
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber address to query. |
+
+**Auth:** None.
+
+**Returns:** `i128` — amount spent today in stroops. Returns `0` if no spend is recorded.
+
+**Storage read:** `DataKey::DailySpent(user)` in temporary storage.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_daily_spent \
+  --user <USER_ADDRESS>
+```
+
+---
+
+### `extend_subscription_ttl`
+
+Extends the TTL of a user's subscription record in persistent storage.
+
+```
+extend_subscription_ttl(env: Env, user: Address)
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber address to extend TTL for. |
+
+**Auth:** None.
+
+**Storage written:** Extends TTL of `DataKey::Subscription(user)` in persistent storage.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- extend_subscription_ttl \
+  --user <USER_ADDRESS>
+```
+
+---
+
+### `get_trial_end`
+
+Returns the trial end timestamp if the user is in a trial period.
+
+```
+get_trial_end(env: Env, user: Address) -> Option<u64>
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber address to query. |
+
+**Auth:** None.
+
+**Returns:** `Option<u64>` — Unix timestamp when trial ends, or `None` if no trial or no subscription.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_trial_end \
+  --user <USER_ADDRESS>
+```
+
+---
+
+### `set_grace_period`
+
+Sets the contract-wide grace period for charges. Only the contract admin can call this.
+
+```
+set_grace_period(env: Env, seconds: u64)
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `seconds` | `u64` | Number of seconds after the interval elapses during which charge() is still allowed. |
+
+**Auth:** Admin only.
+
+**Storage written:** `DataKey::GracePeriod` in instance storage.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <ADMIN_KEY> \
+  --network testnet \
+  -- set_grace_period \
+  --seconds 86400
+```
+
+---
+
+### `add_merchant`
+
+Adds a merchant to the whitelist. Only the contract admin can call this.
+
+```
+add_merchant(env: Env, merchant: Address)
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `merchant` | `Address` | The merchant address to whitelist. |
+
+**Auth:** Admin only.
+
+**Storage written:** `DataKey::MerchantWhitelist(merchant)` in persistent storage.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <ADMIN_KEY> \
+  --network testnet \
+  -- add_merchant \
+  --merchant <MERCHANT_ADDRESS>
+```
+
+---
+
+### `remove_merchant`
+
+Removes a merchant from the whitelist. Only the contract admin can call this.
+
+```
+remove_merchant(env: Env, merchant: Address)
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `merchant` | `Address` | The merchant address to remove from the whitelist. |
+
+**Auth:** Admin only.
+
+**Storage written:** Removes `DataKey::MerchantWhitelist(merchant)` from persistent storage.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <ADMIN_KEY> \
+  --network testnet \
+  -- remove_merchant \
+  --merchant <MERCHANT_ADDRESS>
+```
+
+---
+
+### `set_whitelist_enabled`
+
+Enables or disables the merchant whitelist. Only the contract admin can call this.
+
+```
+set_whitelist_enabled(env: Env, enabled: bool)
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `enabled` | `bool` | True to enable the whitelist, false to disable. |
+
+**Auth:** Admin only.
+
+**Storage written:** `DataKey::WhitelistEnabled` in instance storage.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <ADMIN_KEY> \
+  --network testnet \
+  -- set_whitelist_enabled \
+  --enabled true
+```
+
+---
+
+### `set_fee`
+
+Sets the protocol fee collection settings. Only the contract admin can call this.
+
+```
+set_fee(env: Env, collector: Address, bps: u32)
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `collector` | `Address` | The address that will receive the protocol fees. |
+| `bps` | `u32` | The fee amount in basis points (1 bps = 0.01%). |
+
+**Auth:** Admin only.
+
+**Storage written:** `DataKey::FeeCollector` and `DataKey::FeeBps` in instance storage.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <ADMIN_KEY> \
+  --network testnet \
+  -- set_fee \
+  --collector <COLLECTOR_ADDRESS> \
+  --bps 100
+```
+
+---
+
+### `get_merchant_revenue_history`
+
+Returns per-day revenue for the given merchant for the last `days` days, oldest to newest.
+
+```
+get_merchant_revenue_history(env: Env, merchant: Address, days: u32) -> Vec<i128>
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `merchant` | `Address` | The merchant address to query. |
+| `days` | `u32` | The number of days of history to retrieve. |
+
+**Auth:** None.
+
+**Returns:** `Vec<i128>` — Daily revenue in stroops, ordered oldest to newest.
+
+**Storage read:** `DataKey::MerchantRevenueDay(merchant, day)` in persistent storage.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_merchant_revenue_history \
+  --merchant <MERCHANT_ADDRESS> \
+  --days 7
+```
+
+---
+
+### `get_referrer`
+
+Returns the referrer address recorded for a subscriber.
+
+```
+get_referrer(env: Env, user: Address) -> Option<Address>
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber address to query. |
+
+**Auth:** None.
+
+**Returns:** `Option<Address>` — `None` if no referrer was recorded.
+
+**Storage read:** `DataKey::Referral(user)` in persistent storage.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_referrer \
+  --user <USER_ADDRESS>
+```
+
+---
+
+### `migrate`
+
+Upgrades contract storage to the latest schema version. Safe to call multiple times.
+
+```
+migrate(env: Env)
+```
+
+**Auth:** None (admin restriction can be added in future versions).
+
+**Storage written:** `DataKey::SchemaVersion` in instance storage.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- migrate
+```
+
+---
+
+### `get_schema_version`
+
+Returns the current storage schema version.
+
+```
+get_schema_version(env: Env) -> u32
+```
+
+**Auth:** None.
+
+**Returns:** `u32` — defaults to `1` before the first `migrate()` call.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_schema_version
+```
+
+---
+
+### `set_metadata`
+
+Attaches a short label string (e.g. plan name) to the caller's subscription.
+
+```
+set_metadata(env: Env, user: Address, label: String)
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber. Must match the transaction signer. |
+| `label` | `String` | Short display label (e.g. `"pro"`, `"basic"`). |
+
+**Auth:** `user.require_auth()`.
+
+**Storage written:** `DataKey::SubscriptionMeta(user)` in persistent storage.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source <USER_KEY> \
+  --network testnet \
+  -- set_metadata \
+  --user <USER_ADDRESS> \
+  --label pro
+```
+
+---
+
+### `get_metadata`
+
+Returns the metadata label for a subscriber.
+
+```
+get_metadata(env: Env, user: Address) -> Option<String>
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber address to query. |
+
+**Auth:** None.
+
+**Returns:** `Option<String>` — `None` if no label has been set.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_metadata \
+  --user <USER_ADDRESS>
+```
+
+---
+
+### `get_charge_history`
+
+Returns the last (up to 12) charge timestamps for a subscriber, ordered oldest → newest.
+
+```
+get_charge_history(env: Env, user: Address) -> Vec<u64>
+```
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `user` | `Address` | The subscriber address to query. |
+
+**Auth:** None.
+
+**Returns:** `Vec<u64>` — UNIX timestamps of successful `charge()` calls. Empty if no charges have occurred.
+
+**Storage read:** `DataKey::ChargeHistory(user)` in persistent storage.
+
+**CLI example**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_charge_history \
+  --user <USER_ADDRESS>
+```
+
+---
+
+## Units & Conversions
+
+All amounts are in **stroops** — the smallest unit of a Stellar token.
+
+| Amount | Stroops |
+| --- | --- |
+| 1 XLM | 10,000,000 |
+| 0.5 XLM | 5,000,000 |
+| 0.0000001 XLM | 1 |
+
+All intervals are in **seconds**.
+
+| Interval | Seconds |
+| --- | --- |
+| 1 day | 86,400 |
+| 1 week | 604,800 |
+| 30 days | 2,592,000 |
+
+---
+
+## Events Reference
+
+All events can be indexed by listening to the Stellar RPC event stream for the FlowPay contract ID.
+
+| Event name | Topic | Data |
+| --- | --- | --- |
+| `subscribed` | `("subscribed", user_address)` | `(merchant, amount, interval)` |
+| `charged` | `("charged", user_address)` | `(merchant, amount, timestamp)` |
+| `pay_per_use` | `("pay_per_use", user_address)` | `(merchant, amount)` |
+| `cancelled` | `("cancelled", user_address)` | `()` |
+| `paused` | `("paused", user_address)` | `()` |
+| `resumed` | `("resumed", user_address)` | `()` |
+| `referred` | `("referred", user_address)` | `referrer_address` |
