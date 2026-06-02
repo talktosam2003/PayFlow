@@ -94,6 +94,15 @@ fn test_subscribe_and_charge() {
     assert!(sub_after.last_charged > 0);
 }
 
+#[test]
+fn test_batch_charge_empty() {
+    let (env, contract_id, _, _, _) = setup();
+    let client = FlowPayClient::new(&env, &contract_id);
+
+    let results = client.batch_charge(&soroban_sdk::vec![&env]);
+    assert_eq!(results.len(), 0);
+}
+
 /// charge() must decrease user balance and increase merchant balance by exactly the subscription amount.
 #[test]
 fn test_charge_exact_transfer_amount() {
