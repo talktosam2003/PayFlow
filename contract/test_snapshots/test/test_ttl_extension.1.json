@@ -163,7 +163,7 @@
     "base_reserve": 0,
     "min_persistent_entry_ttl": 4096,
     "min_temp_entry_ttl": 16,
-    "max_entry_ttl": 6312000,
+    "max_entry_ttl": 10000000,
     "ledger_entries": [
       [
         {
@@ -623,7 +623,7 @@
             },
             "ext": "v0"
           },
-          6311999
+          9999999
         ]
       ],
       [
@@ -656,7 +656,7 @@
             },
             "ext": "v0"
           },
-          6311999
+          9999999
         ]
       ],
       [

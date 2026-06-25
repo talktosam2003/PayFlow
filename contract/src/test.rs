@@ -983,6 +983,9 @@ fn test_interval_too_short() {
 fn test_interval_minimum_valid() {
     let (env, contract_id, token_addr, user, merchant) = setup();
     let client = FlowPayClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&token_addr, &admin);
+    client.set_min_interval(&60u64);
 
     client.subscribe(&user, &merchant, &1_0000000, &3600, &token_addr, &None, &None);
     let sub = client.get_subscription(&user).unwrap();
@@ -2176,6 +2179,10 @@ fn test_ttl_extension() {
     let (env, contract_id, token_addr, user, merchant) = setup();
     let client = FlowPayClient::new(&env, &contract_id);
 
+    env.ledger().with_mut(|l| {
+        l.max_entry_ttl = 10_000_000;
+    });
+
     client.subscribe(
         &user,
         &merchant,
@@ -2215,7 +2222,7 @@ fn test_ttl_extension() {
 
 #[test]
 #[should_panic]
-fn test_subscribe_interval_below_60_panics() {
+fn test_subscribe_interval_under_60_panics() {
     let (env, contract_id, token_addr, user, merchant) = setup();
     let client = FlowPayClient::new(&env, &contract_id);
 
@@ -2226,6 +2233,9 @@ fn test_subscribe_interval_below_60_panics() {
 fn test_subscribe_interval_minimum_succeeds() {
     let (env, contract_id, token_addr, user, merchant) = setup();
     let client = FlowPayClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&token_addr, &admin);
+    client.set_min_interval(&60u64);
 
     client.subscribe(&user, &merchant, &1_0000000, &3600, &token_addr, &None, &None);
 
@@ -2234,10 +2244,15 @@ fn test_subscribe_interval_minimum_succeeds() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "Error(Contract, #15)")]
 fn test_subscribe_amount_above_cap_panics() {
     let (env, contract_id, token_addr, user, merchant) = setup();
     let client = FlowPayClient::new(&env, &contract_id);
+
+    let sac = StellarAssetClient::new(&env, &token_addr);
+    sac.mint(&user, &(MAX_SUBSCRIPTION_AMOUNT + 1));
+    let token = TokenClient::new(&env, &token_addr);
+    token.approve(&user, &contract_id, &(MAX_SUBSCRIPTION_AMOUNT + 1), &200);
 
     client.subscribe(
         &user,
@@ -2679,17 +2694,32 @@ fn test_subscriber_page_offset_beyond_count_returns_empty() {
 
 #[test]
 fn test_subscriber_page_limit_capped_at_50() {
-    let (env, contract_id, token_addr, user, merchant) = setup();
+    let (env, contract_id, token_addr, _user, merchant) = setup();
     let client = FlowPayClient::new(&env, &contract_id);
+    let sac = StellarAssetClient::new(&env, &token_addr);
 
-    client.subscribe(&user, &merchant, &1_0000000, &86400, &token_addr, &None, &None);
+    for _ in 0..52 {
+        let sub_user = Address::generate(&env);
+        sac.mint(&sub_user, &10_000_0000000);
+        let token = TokenClient::new(&env, &token_addr);
+        token.approve(&sub_user, &contract_id, &10_000_0000000, &200);
 
-    // limit > 50 returns at most 50 (here only 1 entry exists, so we get 1)
+        client.subscribe(
+            &sub_user,
+            &merchant,
+            &1_0000000,
+            &86400,
+            &token_addr,
+            &None,
+            &None,
+        );
+    }
+
+    assert_eq!(client.get_subscriber_count(), 52);
+
     let page = client.get_subscriber_page(&0u64, &100u32);
-    assert_eq!(page.len(), 1);
+    assert_eq!(page.len(), 50);
 }
-
-// ─────────────────────────────────────────────
 // Issue #231: token.rs SAC compatibility test
 // ─────────────────────────────────────────────
 

@@ -193,9 +193,7 @@ impl FlowPay {
             env.panic_with_error(ContractError::MerchantFrozen);
         }
 
-        if amount <= 0 {
-            env.panic_with_error(ContractError::AmountMustBePositive);
-        }
+        validation::require_valid_amount(&env, amount);
         if interval == 0 {
             env.panic_with_error(ContractError::IntervalMustBePositive);
         }
@@ -224,6 +222,9 @@ impl FlowPay {
         let trial_duration = trial_period.unwrap_or(0);
         let last_charged = now + trial_duration;
 
+        let existing = storage::get_subscription(&env, &user);
+        let should_increment = existing.as_ref().map_or(true, |s| !s.active);
+
         let sub = Subscription {
             merchant,
             amount,
@@ -236,16 +237,6 @@ impl FlowPay {
             label: Symbol::new(&env, "default"),
             trial_duration,
         };
-
-        let existing_sub: Option<Subscription> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Subscription(user.clone()));
-
-        let should_increment = existing_sub
-            .as_ref()
-            .map(|existing| !existing.active)
-            .unwrap_or(true);
 
         env.storage()
             .persistent()
