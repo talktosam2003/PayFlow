@@ -59,6 +59,8 @@ pub fn publish_min_interval_updated(env: &Env, seconds: u64) {
 pub fn publish_merchant_history_cleared(env: &Env, merchant: &Address) {
     env.events()
         .publish((Symbol::new(env, "merch_hist_cleared"),), merchant.clone());
+}
+
 pub fn publish_paused(env: &Env, user: &Address) {
     env.events()
         .publish((Symbol::new(env, "paused"), user.clone()), ());

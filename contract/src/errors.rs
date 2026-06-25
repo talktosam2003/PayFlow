@@ -24,8 +24,6 @@ pub enum ContractError {
     GracePeriodElapsed = 9,
     /// Returned when a merchant is not whitelisted
     MerchantNotWhitelisted = 10,
-    IntervalTooShort = 27,
-    IntervalTooShort = 11,
     /// Returned when a user attempts to refer themselves
     SelfReferral = 11,
     /// Returned when the token address is not a contract
