@@ -3121,6 +3121,37 @@ fn test_set_metadata_label_exceeding_limit_fails() {
 
     client.set_metadata(&user, &invalid_label);
 }
+// ─────────────────────────────────────────────
+// Issue #469: set_subscription_label auth and alias tests
+// ─────────────────────────────────────────────
+#[test]
+fn test_set_metadata_wrong_user_panics() {
+    let (env, contract_id, token_addr, user, merchant) = setup();
+    let client = FlowPayClient::new(&env, &contract_id);
+    client.subscribe(&user, &merchant, &1_0000000, &86400, &token_addr, &None, &None);
+    let attacker = Address::generate(&env);
+    let label = soroban_sdk::String::from_str(&env, "hacked");
+    client.set_metadata(&attacker, &label);
+}
+
+#[test]
+fn test_get_subscription_label_returns_set_value() {
+    let (env, contract_id, token_addr, user, merchant) = setup();
+    let client = FlowPayClient::new(&env, &contract_id);
+    client.subscribe(&user, &merchant, &1_0000000, &86400, &token_addr, &None, &None);
+    let label = soroban_sdk::String::from_str(&env, "premium");
+    client.set_metadata(&user, &label);
+    assert_eq!(client.get_subscription_label(&user), Some(label));
+}
+
+#[test]
+fn test_get_subscription_label_none_when_not_set() {
+    let (env, contract_id, _token_addr, _user, _merchant) = setup();
+    let client = FlowPayClient::new(&env, &contract_id);
+    let random = Address::generate(&env);
+    assert!(client.get_subscription_label(&random).is_none());
+}
+
 
 // ─────────────────────────────────────────────
 // Tests for pause() and resume()

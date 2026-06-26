@@ -238,7 +238,7 @@ impl FlowPay {
             paused: false,
             token,
             referrer: referrer.clone(),
-            label: Symbol::new(&env, "default"),
+            label: Symbol::new(&env, ""), // deprecated: use SubscriptionMeta storage instead
             trial_duration,
         };
 
@@ -1067,6 +1067,11 @@ impl FlowPay {
 
     /// Returns the metadata label for a subscriber, or `None` if not set.
     pub fn get_metadata(env: Env, user: Address) -> Option<String> {
+        subscription_metadata::get_metadata(&env, &user)
+    }
+
+    /// Alias for `get_metadata` — returns the metadata label for a subscriber, or `None` if not set.
+    pub fn get_subscription_label(env: Env, user: Address) -> Option<String> {
         subscription_metadata::get_metadata(&env, &user)
     }
 
